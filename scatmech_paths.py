@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 from typing import Final
@@ -75,16 +74,3 @@ def format_missing_solver_message(program: str) -> str:
         f"or add '{program}' to your PATH.\n"
         f"Checked SCATMECH_BIN directory: {bin_dir}"
     )
-
-
-def open_with_default_app(path: str | Path) -> None:
-    target = Path(path)
-    if not target.exists():
-        raise FileNotFoundError(target)
-
-    if sys.platform.startswith("win"):
-        os.startfile(str(target))
-        return
-
-    opener = "open" if sys.platform == "darwin" else "xdg-open"
-    subprocess.Popen([opener, str(target)])

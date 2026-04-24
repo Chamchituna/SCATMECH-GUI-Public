@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 
@@ -346,6 +347,19 @@ def build_default_cross_grating(
             children[name] = build_default_one_d_grating(default_model)
         else:
             children[name] = build_default_cross_grating(default_model, allow_overlay=False)
+
+    if model == "Overlaid_CrossGrating":
+        top = _mapping(children.get("top"))
+        bottom = _mapping(children.get("bottom"))
+        top_params = _mapping(top.get("params"))
+        bottom_params = dict(_mapping(bottom.get("params")))
+        top_medium_t = _text(top_params.get("medium_t"), "(4.05,0.05)")
+        if "medium_i" in bottom_params:
+            bottom_params["medium_i"] = top_medium_t
+            children["bottom"] = {
+                **bottom,
+                "params": bottom_params,
+            }
     return {
         "kind": "cross",
         "model": model,
@@ -441,6 +455,12 @@ def _serialize_cross_grating(node: Any, *, allow_overlay: bool) -> List[str]:
 
 def serialize_cross_grating(node: Any) -> List[str]:
     return _serialize_cross_grating(node, allow_overlay=True)
+
+
+def validate_one_d_grating(node: Any) -> List[str]:
+    errors: List[str] = []
+    _validate_one_d_grating(node, errors=errors, path="grating")
+    return errors
 
 
 def validate_cross_grating(node: Any) -> List[str]:
@@ -551,5 +571,9 @@ def _validate_one_d_grating(node: Any, *, errors: List[str], path: str) -> None:
         errors.append(f"{path}: unsupported 1D grating model '{model or '<blank>'}'")
         return
     params = _mapping(raw.get("params"))
-    if model == "Generic_Grating" and not _text(params.get("filename")).strip():
-        errors.append(f"{path}.params.filename is required for Generic_Grating")
+    if model == "Generic_Grating":
+        filename = _text(params.get("filename")).strip()
+        if not filename:
+            errors.append(f"{path}.params.filename is required for Generic_Grating")
+        elif not Path(filename).exists():
+            errors.append(f"{path}.params.filename does not exist: {filename}")

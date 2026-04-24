@@ -3,16 +3,13 @@ import re
 import csv
 import datetime
 import subprocess
-import importlib
-import importlib.util
-import sys
-from pathlib import Path
 from scatmech_paths import (
     configure_scatmech_path,
     find_solver_executable,
     format_missing_solver_message,
     get_data_dir,
 )
+from rcwplot import plot_csv as plot_rcw_csv
 from scatmech_gratings import ONE_D_GRATING_SPECS, get_one_d_grating_spec
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit,
@@ -21,7 +18,6 @@ from PyQt5.QtWidgets import (
     QFormLayout, QFileDialog, QComboBox,
     QSizePolicy, QTableWidget, QTableWidgetItem, QDialog
 )
-from PyQt5.QtCore import pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -38,12 +34,9 @@ _TYPE_CHOICES = [
 
 class RCWForm(QWidget):
 
-    requestClearPlot = pyqtSignal()
-
     def __init__(self):
         super().__init__()
-        
-        self._suspend_preview_log = False
+
         self._grating_param_store = {}
         self._current_grating_module = None
         self.grating_param_inputs = {}
@@ -122,11 +115,6 @@ class RCWForm(QWidget):
         ctrl_widget.setLayout(ctrl_row)
         self.form_layout.addWidget(ctrl_widget)
 
-        self.form_layout.addWidget(QLabel("Input Deck Preview:"))
-        self.input_preview = QTextEdit()
-        self.input_preview.setMinimumHeight(140)
-        self.form_layout.addWidget(self.input_preview)
-
         self.form_layout.addWidget(QLabel("Log:"))
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -141,29 +129,13 @@ class RCWForm(QWidget):
         self.open_input_btn.clicked.connect(self.open_last_input)
         self.grating_model_combo.currentTextChanged.connect(self._on_grating_model_changed)
         
-        self._plot_clear_callback = None
         self.last_stdout_path = None
         self.last_input_path = None
         self.last_csv_path = None
         
         self._rebuild_grating_param_form(self.grating_model_combo.currentText())
-        self.populate_input_preview()
-
-    def connect_plot_clear(self, slot):
-        self._plot_clear_callback = slot
 
     def clear_plot(self):
-        sig = getattr(self, "requestClearPlot", None)
-        if sig is not None:
-            try:
-                sig.emit()
-            except Exception as exc:
-                self.log.append(f"Clear-plot signal error: {exc}")
-        if callable(getattr(self, "_plot_clear_callback", None)):
-            try:
-                self._plot_clear_callback()
-            except Exception as exc:
-                self.log.append(f"Clear-plot callback error: {exc}")
         if hasattr(self, "figure"):
             self.figure.clear()
         if hasattr(self, "canvas"):
@@ -178,12 +150,6 @@ class RCWForm(QWidget):
                 widget.setText(fname)
             else:
                 self.log.append("Filename field not available for current grating module.")
-
-    def populate_input_preview(self):
-        payload = self._build_input_payload()
-        self.input_preview.setPlainText(payload)
-        if not getattr(self, "_suspend_preview_log", False):
-            self.log.append("Parameters updated.")
             
     def _build_input_payload(self):
         order = self.order.text().strip() or "6"
@@ -244,7 +210,6 @@ class RCWForm(QWidget):
     def _add_grating_param_row(self, name, label, value, browse=False):
         line_edit = QLineEdit()
         line_edit.setText(value or "")
-        line_edit.textChanged.connect(self._on_grating_param_changed)
         self.grating_param_inputs[name] = line_edit
 
         if browse:
@@ -264,19 +229,9 @@ class RCWForm(QWidget):
     def _on_grating_model_changed(self, module_name):
         self._store_current_grating_params()
         self._rebuild_grating_param_form(module_name)
-        self._on_grating_param_changed(module_name)
-
-    def _on_grating_param_changed(self, _value=None):
-        previous_state = self._suspend_preview_log
-        self._suspend_preview_log = True
-        try:
-            self.populate_input_preview()
-        finally:
-            self._suspend_preview_log = previous_state
 
     def run_rcwprog(self):
         payload = self._build_input_payload()
-        self.input_preview.setPlainText(payload)
         self.last_csv_path = None        
 
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -405,63 +360,12 @@ class RCWForm(QWidget):
 
     def render_with_external(self, csv_path: str):
         self.figure.clear()
-        ax = self.figure.gca()
-
-        here = os.path.dirname(os.path.abspath(__file__))
-        cwd = os.getcwd()
-        csv_dir = os.path.dirname(os.path.abspath(csv_path)) if csv_path else None
-
-        tried = []
-
-        def _try_normal(name):
-            try:
-                mod = importlib.import_module(name)
-                return mod, f"import {name}"
-            except Exception as exc:
-                tried.append(f"import {name}: {exc}")
-                return None, None
-
-        def _try_file(path):
-            try:
-                if path and os.path.exists(path):
-                    spec = importlib.util.spec_from_file_location("rcwplot", path)
-                    if spec and spec.loader:
-                        mod = importlib.util.module_from_spec(spec)
-                        sys.modules["rcwplot"] = mod
-                        spec.loader.exec_module(mod)
-                        return mod, f"load {path}"
-            except Exception as exc:
-                tried.append(f"load {path}: {exc}")
-            return None, None
-
-        if here not in sys.path:
-            sys.path.insert(0, here)
-
-        mod, how = _try_normal("rcwplot")
-        if mod is None:
-            mod, how = _try_file(os.path.join(here, "rcwplot.py"))
-        if mod is None:
-            mod, how = _try_file(os.path.join(cwd, "rcwplot.py"))
-        if mod is None and csv_dir:
-            mod, how = _try_file(os.path.join(csv_dir, "rcwplot.py"))
-
-        if mod is None:
-            self.log.append("Could not import rcwplot.py: " + " | ".join(tried))
-            self.canvas.draw()
-            return
-        else:
-            self.log.append(f"rcwplot resolved via: {how}")
-
-        fn = getattr(mod, "plot_csv", None)
-        if not callable(fn):
-            self.log.append("rcwplot.py found, but it must define plot_csv(ax, csv_path).")
-            self.canvas.draw()
-            return
+        ax = self.figure.add_subplot(111)
 
         try:
-            fn(ax, csv_path)
+            plot_rcw_csv(ax, csv_path)
             self.canvas.draw()
-            self.log.append("Plot updated via rcwplot.plot_csv")
+            self.log.append("Plot updated.")
         except Exception as exc:
             self.log.append(f"rcwplot render error: {exc}")
             self.canvas.draw()
@@ -583,7 +487,6 @@ class RCWForm(QWidget):
                 name: widget.text().strip()
                 for name, widget in self.grating_param_inputs.items()
             },
-            "input_deck": self.input_preview.toPlainText(),
         }
 
     def from_params(self, params: dict):
@@ -616,14 +519,3 @@ class RCWForm(QWidget):
             if stored_params:
                 self._grating_param_store[current_module] = stored_params
                 self._rebuild_grating_param_form(current_module)
-
-        deck = params.get("input_deck")
-        if deck:
-            self.input_preview.setPlainText(deck)
-
-        previous_state = self._suspend_preview_log
-        self._suspend_preview_log = True
-        try:
-            self.populate_input_preview()
-        finally:
-            self._suspend_preview_log = previous_state

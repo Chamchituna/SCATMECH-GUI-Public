@@ -1,10 +1,9 @@
 import sys
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QStackedWidget, QScrollArea, QSizePolicy, QPushButton,
+    QStackedWidget, QScrollArea, QSizePolicy, QPushButton,
     QButtonGroup
 )
-from PyQt5.QtCore import Qt
 
 from brdf_form import BRDFForm
 from mie_form import MieForm
@@ -48,18 +47,6 @@ class SCATMECHGui(QWidget):
         root.addLayout(top)
 
         self.stack = QStackedWidget(self)
-
-        def placeholder(name):
-            from PyQt5.QtWidgets import QWidget, QVBoxLayout, QLabel
-            widget = QWidget(self)
-            layout = QVBoxLayout(widget)
-            layout.addStretch(1)
-            label = QLabel(f"{name} form not available yet.", widget)
-            label.setStyleSheet("color:#888;")
-            label.setAlignment(Qt.AlignCenter)
-            layout.addWidget(label)
-            layout.addStretch(1)
-            return widget
 
         self.brdf_form = BRDFForm()
         self.reflect_form = ReflectForm()

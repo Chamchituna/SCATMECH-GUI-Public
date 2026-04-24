@@ -3,15 +3,13 @@ import csv
 import re
 import datetime
 import subprocess
-import importlib, importlib.util, sys
-from pathlib import Path
 from scatmech_paths import (
     configure_scatmech_path,
     find_solver_executable,
     format_missing_solver_message,
     get_data_dir,
-    open_with_default_app,
 )
+from reflectplot import plot_csv as plot_reflect_csv
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit,
     QVBoxLayout, QHBoxLayout,
@@ -19,7 +17,7 @@ from PyQt5.QtWidgets import (
     QTextEdit, QGroupBox,
     QFormLayout,
     QTableWidget, QTableWidgetItem,
-    QSizePolicy, QMessageBox
+    QSizePolicy, QMessageBox, QDialog
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -116,7 +114,7 @@ class ReflectForm(QWidget):
 
         # Output / actions
         action_row = QHBoxLayout()
-        self.run_btn = QPushButton("Run reflectprog")
+        self.run_btn = QPushButton("Run ReflectProg")
         self.clear_btn = QPushButton("Clear Plot")
         self.open_output_btn = QPushButton("Open Last Output")
         self.open_input_btn = QPushButton("Open Last Input")
@@ -150,10 +148,12 @@ class ReflectForm(QWidget):
         self.clear_btn.clicked.connect(self.clear_plot)
         self.open_output_btn.clicked.connect(self.open_last_output)
         self.open_input_btn.clicked.connect(self.open_last_input)
+        self.plot_column.currentTextChanged.connect(self._on_plot_column_changed)
 
         # State
         self.last_stdout_path = None
         self.last_input_path = None
+        self.last_csv_path = None
 
         # Demo layer
         self._add_layer(default_material="(1.50,0.00)", default_thickness="0.100000")
@@ -191,24 +191,107 @@ class ReflectForm(QWidget):
     def clear_plot(self):
         self.figure.clear()
         self.canvas.draw()
+        self.output_box.append("Plot cleared.")
 
     def open_last_output(self):
-        if self.last_stdout_path and os.path.exists(self.last_stdout_path):
-            try:
-                open_with_default_app(self.last_stdout_path)
-            except Exception as exc:
-                self.output_box.append(f"Could not open output file: {exc}")
-        else:
-            self.output_box.append("No output to open.")
+        data_dir = str(get_data_dir())
+        path = getattr(self, "last_csv_path", None)
+        if not path or not os.path.exists(path):
+            path = self._find_latest("reflect_output_", data_dir, suffix=".csv")
+        if not path:
+            self.output_box.append("No Reflect output file found in DATA.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Output: {os.path.basename(path)}")
+        layout = QVBoxLayout(dlg)
+
+        txt = QTextEdit(dlg)
+        txt.setReadOnly(True)
+        txt.setMinimumHeight(120)
+        layout.addWidget(txt)
+
+        table = QTableWidget(dlg)
+        table.setMinimumHeight(320)
+        layout.addWidget(table)
+
+        btn_row = QHBoxLayout()
+        close_btn = QPushButton("Close", dlg)
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        close_btn.clicked.connect(dlg.accept)
+
+        try:
+            with open(path, newline="", encoding="utf-8") as handle:
+                rows = list(csv.reader(handle))
+            if not rows:
+                txt.setPlainText("(Empty CSV)")
+            else:
+                width = max(len(row) for row in rows)
+                table.setColumnCount(width)
+                table.setRowCount(len(rows))
+                table.setHorizontalHeaderLabels([f"C{index + 1}" for index in range(width)])
+                for row_index, row in enumerate(rows):
+                    for col_index, value in enumerate(row):
+                        table.setItem(row_index, col_index, QTableWidgetItem(value))
+                table.setSortingEnabled(True)
+                table.resizeColumnsToContents()
+                stdout_path = getattr(self, "last_stdout_path", None)
+                if stdout_path and os.path.exists(stdout_path):
+                    txt.setPlainText(self._read_file(stdout_path))
+                else:
+                    txt.setPlainText("(Stdout log not available)")
+        except Exception as exc:
+            txt.setPlainText(f"(Failed to open CSV: {exc})")
+
+        dlg.resize(900, 700)
+        dlg.exec_()
 
     def open_last_input(self):
-        if self.last_input_path and os.path.exists(self.last_input_path):
-            try:
-                open_with_default_app(self.last_input_path)
-            except Exception as exc:
-                self.output_box.append(f"Could not open input file: {exc}")
-        else:
-            self.output_box.append("No input file to open.")
+        data_dir = str(get_data_dir())
+        path = getattr(self, "last_input_path", None)
+        if not path or not os.path.exists(path):
+            path = self._find_latest("reflect_input_", data_dir)
+        if not path:
+            self.output_box.append("No Reflect input file found in DATA.")
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Input: {os.path.basename(path)}")
+        layout = QVBoxLayout(dlg)
+        view = QTextEdit(dlg)
+        view.setReadOnly(True)
+        view.setPlainText(self._read_file(path))
+        layout.addWidget(view)
+        btn_row = QHBoxLayout()
+        close_btn = QPushButton("Close", dlg)
+        btn_row.addStretch(1)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+        close_btn.clicked.connect(dlg.accept)
+        dlg.resize(700, 500)
+        dlg.exec_()
+
+    def _find_latest(self, prefix: str, folder: str, suffix: str = ".txt"):
+        try:
+            paths = [
+                os.path.join(folder, filename)
+                for filename in os.listdir(folder)
+                if filename.startswith(prefix) and filename.endswith(suffix)
+            ]
+            if not paths:
+                return None
+            return max(paths, key=lambda path: os.path.getmtime(path))
+        except Exception:
+            return None
+
+    def _read_file(self, path: str):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+                return handle.read()
+        except Exception as exc:
+            return f"(Could not open file: {exc})"
 
     # Build console session for reflectprog 
     def _build_input_lines(self):
@@ -242,64 +325,14 @@ class ReflectForm(QWidget):
     # External plot 
     def render_with_external(self, csv_path: str, y_idx: int):
         self.figure.clear()
-        ax = self.figure.gca()
-
-        here = Path(__file__).resolve().parent
-        cwd = Path(os.getcwd())
-        csv_dir = Path(csv_path).resolve().parent if csv_path else None
-
-        tried = []
-        mod = None
-        how = None
-
-        def _try_import(name):
-            nonlocal mod, how
-            try:
-                mod = importlib.import_module(name)
-                how = f"import {name}"
-                return True
-            except Exception as e:
-                tried.append(f"import {name}: {e}")
-                return False
-
-        def _try_path(path):
-            nonlocal mod, how
-            try:
-                if path and path.exists():
-                    spec = importlib.util.spec_from_file_location("reflectplot", str(path))
-                    if spec and spec.loader:
-                        mod = importlib.util.module_from_spec(spec)
-                        sys.modules["reflectplot"] = mod
-                        spec.loader.exec_module(mod)
-                        how = f"spec_from_file_location({path})"
-                        return True
-            except Exception as e:
-                tried.append(f"load {path}: {e}")
-            return False
-
-        if not _try_import("reflectplot"):
-            if not _try_path(here / "reflectplot.py"):
-                if not _try_path(cwd / "reflectplot.py") and csv_dir:
-                    _try_path(csv_dir / "reflectplot.py")
-
-        if mod is None:
-            self.output_box.append("Could not import reflectplot.py: " + " | ".join(tried))
-            self.canvas.draw()
-            return
-        else:
-            self.output_box.append(f"reflectplot resolved via: {how}")
-
-        fn = getattr(mod, "plot_csv", None)
-        if not callable(fn):
-            self.output_box.append("reflectplot.py found, but it must define plot_csv(ax, csv_path, ...).")
-            self.canvas.draw()
-            return
+        ax = self.figure.add_subplot(111)
+        self.last_csv_path = csv_path
 
         try:
             label = "Rp" if y_idx == 1 else ("Rs" if y_idx == 2 else None)
-            fn(ax, csv_path, x_col=0, y_col=y_idx, semilogy=False, label=label)
+            plot_reflect_csv(ax, csv_path, x_col=0, y_col=y_idx, semilogy=False, label=label)
             self.canvas.draw()
-            self.output_box.append("Plot updated via reflectplot.plot_csv")
+            self.output_box.append("Plot updated.")
         except Exception as e:
             self.output_box.append(f"reflectplot render error: {e}")
             self.canvas.draw()
@@ -357,6 +390,7 @@ class ReflectForm(QWidget):
                 writer = csv.writer(csvfile)
                 for ln in data_lines:
                     writer.writerow(ln.split())
+            self.last_csv_path = csv_filename
             self.output_box.append(f"Saved CSV: {csv_filename}")
 
             y_idx = 1 if self.plot_column.currentText().startswith("R_p") else 2
@@ -364,3 +398,60 @@ class ReflectForm(QWidget):
         else:
             self.output_box.append("[Warn] No numeric data lines found in stdout.")
             self.clear_plot()
+
+    def _on_plot_column_changed(self, _text: str):
+        csv_path = getattr(self, "last_csv_path", None)
+        if not csv_path or not os.path.exists(csv_path):
+            return
+        y_idx = 1 if self.plot_column.currentText().startswith("R_p") else 2
+        self.render_with_external(csv_path, y_idx)
+
+    def to_params(self) -> dict:
+        layers = []
+        for row in range(self.tbl.rowCount()):
+            material = self.tbl.item(row, 0)
+            thickness = self.tbl.item(row, 1)
+            if material is None or thickness is None:
+                continue
+            layers.append(
+                {
+                    "material": material.text().strip(),
+                    "thickness_um": thickness.text().strip(),
+                }
+            )
+        return {
+            "wavelength_um": self.wavelength.text().strip(),
+            "substrate": {
+                "n": self.sub_n.text().strip(),
+                "k": self.sub_k.text().strip(),
+            },
+            "layers": layers,
+            "plot_y": self.plot_column.currentText(),
+        }
+
+    def from_params(self, params: dict):
+        if not params:
+            return
+        self.wavelength.setText(str(params.get("wavelength_um", self.wavelength.text())))
+        substrate = params.get("substrate") or {}
+        if isinstance(substrate, dict):
+            if "n" in substrate:
+                self.sub_n.setText(str(substrate["n"]))
+            if "k" in substrate:
+                self.sub_k.setText(str(substrate["k"]))
+
+        while self.tbl.rowCount() > 0:
+            self.tbl.removeRow(0)
+        for layer in params.get("layers", []):
+            if not isinstance(layer, dict):
+                continue
+            self._add_layer(
+                default_material=str(layer.get("material", "(1.50,0.00)")),
+                default_thickness=str(layer.get("thickness_um", "0.100000")),
+            )
+
+        plot_y = params.get("plot_y")
+        if plot_y:
+            index = self.plot_column.findText(str(plot_y))
+            if index >= 0:
+                self.plot_column.setCurrentIndex(index)

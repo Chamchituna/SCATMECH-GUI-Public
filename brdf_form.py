@@ -1,8 +1,8 @@
 import os
 import csv
 import datetime
+import math
 import subprocess
-import importlib, importlib.util, sys
 from pathlib import Path
 import re
 import json
@@ -12,15 +12,19 @@ from scatmech_paths import (
     format_missing_solver_message,
     get_data_dir,
 )
+from brdfplot import plot_csv as plot_brdf_csv
 from scatmech_gratings import (
     CROSS_GRATING_SPECS,
     ONE_D_GRATING_SPECS,
     build_default_cross_grating,
+    build_default_one_d_grating,
     coerce_cross_grating,
     coerce_one_d_grating,
     list_cross_grating_models,
     serialize_cross_grating,
+    serialize_one_d_grating,
     validate_cross_grating,
+    validate_one_d_grating,
 )
 
 from PyQt5.QtWidgets import (
@@ -332,7 +336,7 @@ class BRDFForm(QWidget):
             "Roughness_BRDF_Model", "Facet_BRDF_Model", "Lambertian_BRDF_Model",
             "Local_BRDF_Model", "Instrument_BRDF_Model", "First_Diffuse_BRDF_Model",
             "Two_Source_BRDF_Model", "Three_Source_BRDF_Model", "Four_Source_BRDF_Model",
-            "Transmit_BRDF_Model", "RCW_BRDF_Model", "CrossRCW_BRDF_Model",
+            "Transmit_BRDF_Model", "RCW_BRDF_Model",
             "ZernikeExpansion_BRDF_Model", "Polydisperse_Sphere_BRDF_Model",
         ])
         self.subclass_selector = QComboBox()
@@ -350,7 +354,7 @@ class BRDFForm(QWidget):
         self.wavelength = QLineEdit("0.532")
         self.substrate = QLineEdit("(4.05,0.05)")
         self.direction = QComboBox()
-        self.direction.addItems(list(self.DIRECTION_CODES.keys()))
+        self.direction.addItem("Forward Reflection")
 
         param_layout.addRow("Wavelength (µm):", self.wavelength)
         param_layout.addRow("Substrate (n or file):", self.substrate)
@@ -545,6 +549,8 @@ class BRDFForm(QWidget):
         self.last_input_path = None
         self.last_csv_path = None
         self.last_output_meta = None
+        self.rcw_grating_editor = None
+        self._rcw_grating_state = build_default_one_d_grating()
         self.cross_grating_editor = None
         self._cross_grating_state = build_default_cross_grating()
 
@@ -552,6 +558,7 @@ class BRDFForm(QWidget):
     def clear_plot(self):
         self.figure.clear()
         self.canvas.draw()
+        self.output_box.append("Plot cleared.")
 
     
     def update_subclasses(self):
@@ -580,6 +587,7 @@ class BRDFForm(QWidget):
             ],
             # --- Lambertian
             "Lambertian_BRDF_Model": [
+                "Lambertian_BRDF_Model",
                 "Diffuse_Subsurface_BRDF_Model",
             ],
             # --- Local particle / defect models
@@ -588,7 +596,6 @@ class BRDFForm(QWidget):
                 "OneLayer_BRDF_Model",
                 "Rayleigh_Stack_BRDF_Model",
                 "Double_Interaction_BRDF_Model",
-                "Subsurface_Particle_BRDF_Model",
                 "Bobbert_Vlieger_BRDF_Model",
                 "Axisymmetric_Particle_BRDF_Model",
                 "Subsurface_Bobbert_Vlieger_BRDF_Model",
@@ -691,13 +698,13 @@ class BRDFForm(QWidget):
             ("lambda","double","0.532"),
             ("type","int","0"),
             ("substrate","dielectric_function","(4.05,0.05)"),
-            ("reflectance","Reflectance","Table_Reflectance"),
+            ("reflectance","Reflectance","Table_Reflectance(1)"),
         ],
         "Diffuse_Subsurface_BRDF_Model": [
             ("lambda","double","0.532"),
             ("type","int","0"),
             ("substrate","dielectric_function","(4.05,0.05)"),
-            ("reflectance","Reflectance","Table_Reflectance"),
+            ("reflectance","Reflectance","Table_Reflectance(1)"),
             ("stack","StackModel_Ptr","No_StackModel"),
         ],
         # Local / defect
@@ -773,7 +780,7 @@ class BRDFForm(QWidget):
             ("type","int","0"),
             ("substrate","dielectric_function","(4.05,0.05)"),
             ("density","double","1"),
-            ("Shape","Axisymmetric_Shape","Ellipsoid_Axisymmetric_Shape"),
+            ("Shape","Axisymmetric_Shape","Ellipsoid_Axisymmetric_Shape(npoints=100,vertical=0.05,horizontal=0.05,offset=0)"),
             ("particle","dielectric_function","(1.59,0)"),
             ("stack","StackModel_Ptr","No_StackModel"),
             ("delta","double","0"),
@@ -803,7 +810,7 @@ class BRDFForm(QWidget):
             ("type","int","0"),
             ("substrate","dielectric_function","(4.05,0.05)"),
             ("density","double","1"),
-            ("Shape","Axisymmetric_Shape","Ellipsoid_Axisymmetric_Shape"),
+            ("Shape","Axisymmetric_Shape","Ellipsoid_Axisymmetric_Shape(npoints=100,vertical=0.05,horizontal=0.05,offset=0)"),
             ("particle","dielectric_function","(1.59,0)"),
             ("stack","StackModel_Ptr","No_StackModel"),
             ("delta","double","0"),
@@ -932,6 +939,14 @@ class BRDFForm(QWidget):
 
     def populate_model_params(self):
         """Rebuild parameter widgets when model selection changes."""
+        existing_rcw_editor = getattr(self, "rcw_grating_editor", None)
+        if existing_rcw_editor is not None:
+            try:
+                self._rcw_grating_state = existing_rcw_editor.to_node()
+            except Exception:
+                pass
+        self.rcw_grating_editor = None
+
         existing_editor = getattr(self, "cross_grating_editor", None)
         if existing_editor is not None:
             try:
@@ -954,24 +969,63 @@ class BRDFForm(QWidget):
             # Skip PSD pointer here; PSD is configured in the dedicated PSD section
             if name.lower() == "psd" or dtype == "PSD_Function_Ptr":
                 continue
+            if model == "RCW_BRDF_Model" and dtype == "Grating_Ptr" and name == "grating":
+                editor = OneDGratingEditor(title="1D Grating")
+                editor.from_node(getattr(self, "_rcw_grating_state", build_default_one_d_grating()))
+                self.rcw_grating_editor = editor
+                self.model_params_layout.addRow(editor)
+                continue
             if model == "CrossRCW_BRDF_Model" and dtype == "CrossGrating_Ptr" and name == "grating":
                 editor = CrossGratingEditor(title="Cross Grating")
                 editor.from_node(getattr(self, "_cross_grating_state", build_default_cross_grating()))
                 self.cross_grating_editor = editor
                 self.model_params_layout.addRow(editor)
                 continue
-            le = QLineEdit(str(default))
-            self.param_widgets[name] = le
-            label = f"{name} ({dtype}):"
-            self.model_params_layout.addRow(label, le)
+
+            self._add_model_param_row(
+                name,
+                dtype,
+                str(default),
+                browse=name in {"coefficientfile"},
+            )
 
             lowered = name.lower()
             if lowered == "lambda":
-                le.setText(self.wavelength.text())
+                self.param_widgets[name].setText(self.wavelength.text())
             elif lowered == "substrate":
-                le.setText(self.substrate.text())
+                self.param_widgets[name].setText(self.substrate.text())
             elif lowered == "type":
-                le.setText(self.DIRECTION_CODES.get(self.direction.currentText(), str(default)))
+                self.param_widgets[name].setText(self.DIRECTION_CODES.get(self.direction.currentText(), str(default)))
+
+    def _add_model_param_row(self, name: str, dtype: str, value: str, *, browse: bool = False):
+        line_edit = QLineEdit()
+        line_edit.setText(value)
+        self.param_widgets[name] = line_edit
+        label = f"{name} ({dtype}):"
+
+        if not browse:
+            self.model_params_layout.addRow(label, line_edit)
+            return
+
+        row_widget = QWidget()
+        row_layout = QHBoxLayout(row_widget)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.addWidget(line_edit)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(lambda: self._browse_for_model_file(name))
+        row_layout.addWidget(browse_btn)
+        self.model_params_layout.addRow(label, row_widget)
+
+    def _browse_for_model_file(self, field_name: str):
+        title = "Select file"
+        if field_name == "coefficientfile":
+            title = "Select coefficient file"
+        fname, _ = QFileDialog.getOpenFileName(self, title, "", "All Files (*)")
+        if not fname:
+            return
+        widget = self.param_widgets.get(field_name)
+        if widget is not None:
+            widget.setText(fname)
 
     def update_psd_parameters(self, current: str):
         mapping = {
@@ -1019,6 +1073,8 @@ class BRDFForm(QWidget):
             lowered = name.lower()
             if lowered in {"psd", "lambda", "substrate", "type"}:
                 continue
+            if model == "RCW_BRDF_Model" and dtype == "Grating_Ptr" and name == "grating":
+                continue
             if model == "CrossRCW_BRDF_Model" and dtype == "CrossGrating_Ptr" and name == "grating":
                 continue
             widget = self.param_widgets.get(name)
@@ -1035,6 +1091,14 @@ class BRDFForm(QWidget):
             self._cross_grating_state = tree
             return tree
         return getattr(self, "_cross_grating_state", build_default_cross_grating())
+
+    def _current_rcw_grating_tree(self):
+        editor = getattr(self, "rcw_grating_editor", None)
+        if editor is not None:
+            tree = editor.to_node()
+            self._rcw_grating_state = tree
+            return tree
+        return getattr(self, "_rcw_grating_state", build_default_one_d_grating())
 
     def _append_cross_rcw_input_lines(self, input_lines, *, model_params=None, grating_tree=None):
         params = dict(model_params or {})
@@ -1054,70 +1118,19 @@ class BRDFForm(QWidget):
         self.figure.clear()
         ax = self.figure.add_subplot(111)
 
-        here = Path(__file__).resolve().parent
-        cwd = Path(os.getcwd())
-        csv_dir = Path(csv_path).resolve().parent if csv_path else None
-
         meta = getattr(self, "last_output_meta", None)
         if not meta or meta.get("csv_path") != csv_path:
             meta = self._load_output_meta(csv_path)
         if meta:
             self.last_output_meta = meta
 
-        tried = []
-        mod = None
-        how = None
-
-        def _try_import(name):
-            nonlocal mod, how
-            try:
-                mod = importlib.import_module(name)
-                how = f"import {name}"
-                return True
-            except Exception as e:
-                tried.append(f"import {name}: {e}")
-                return False
-
-        def _try_path(path):
-            nonlocal mod, how
-            try:
-                if path and path.exists():
-                    spec = importlib.util.spec_from_file_location("brdfplot", str(path))
-                    if spec and spec.loader:
-                        mod = importlib.util.module_from_spec(spec)
-                        sys.modules["brdfplot"] = mod
-                        spec.loader.exec_module(mod)
-                        how = f"spec_from_file_location({path})"
-                        return True
-            except Exception as e:
-                tried.append(f"load {path}: {e}")
-            return False
-
-        if not _try_import("brdfplot"):
-            if not _try_path(here / "brdfplot.py"):
-                if not _try_path(cwd / "brdfplot.py") and csv_dir:
-                    _try_path(csv_dir / "brdfplot.py")
-
-        if mod is None:
-            self.output_box.append("Could not import brdfplot.py: " + " | ".join(tried))
-            self.canvas.draw()
-            return
-        else:
-            self.output_box.append(f"brdfplot resolved via: {how}")
-
-        fn = getattr(mod, "plot_csv", None)
-        if not callable(fn):
-            self.output_box.append("brdfplot.py found, but it must define plot_csv(ax, csv_path, ...).")
-            self.canvas.draw()
-            return
-
         try:
             try:
-                fn(ax, csv_path, x_col=x_col, y_col=y_col, semilogy=semilogy, meta=meta)
+                plot_brdf_csv(ax, csv_path, x_col=x_col, y_col=y_col, semilogy=semilogy, meta=meta)
             except TypeError:
-                fn(ax, csv_path, x_col=x_col, y_col=y_col, semilogy=semilogy)
+                plot_brdf_csv(ax, csv_path, x_col=x_col, y_col=y_col, semilogy=semilogy)
             self.canvas.draw()
-            self.output_box.append("Plot updated via brdfplot.plot_csv")
+            self.output_box.append("Plot updated.")
         except Exception as e:
             self.output_box.append(f"brdfplot render error: {e}")
             self.canvas.draw()
@@ -1149,35 +1162,42 @@ class BRDFForm(QWidget):
     def _parse_model_expression(self, text: str):
         raw = (text or "").strip()
         if not raw:
-            return "", {}
+            return "", [], {}
 
         m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*(?:\((.*)\))?\s*$", raw)
         if not m:
-            return raw, {}
+            return raw, [], {}
 
         model_name = m.group(1).strip()
         inner = m.group(2)
         if inner is None:
-            return model_name, {}
+            return model_name, [], {}
 
+        args = []
         kwargs = {}
         for item in self._split_top_level_args(inner):
             if "=" not in item:
+                args.append(item.strip())
                 continue
             key, value = item.split("=", 1)
             kwargs[key.strip().lower()] = value.strip()
-        return model_name, kwargs
+        return model_name, args, kwargs
+
+    def _raise_unsupported_parameterized_expression(self, dtype: str, value: str):
+        raise ValueError(
+            f"Parameterized expressions for {dtype} are not supported in the public GUI: {value}"
+        )
 
     def _append_scatterer_input_lines(self, input_lines, value: str, model_name: str):
-        scatterer_model, kwargs = self._parse_model_expression(value)
+        scatterer_model, _args, kwargs = self._parse_model_expression(value)
         if not scatterer_model:
             scatterer_model = "MieScatterer"
         input_lines.append(scatterer_model)
 
         if scatterer_model != "MieScatterer":
-            # Unknown scatterer expression format for nested AskUser input.
-            # Fall back to model name only.
-            return
+            raise ValueError(
+                f"Unsupported scatterer '{scatterer_model}'. Only MieScatterer is supported in the public GUI."
+            )
 
         default_lambda = self.wavelength.text().strip() or "0.532"
         if model_name == "Subsurface_Particle_BRDF_Model":
@@ -1192,8 +1212,7 @@ class BRDFForm(QWidget):
         input_lines.append(kwargs.get("radius", default_radius))
         input_lines.append(kwargs.get("sphere", default_sphere))
 
-    def _append_psd_input_lines(self, input_lines):
-        current = self.psd_function.currentText()
+    def _append_psd_named_input_lines(self, input_lines, current: str):
         input_lines.append(current)
         if current == "Unit_PSD_Function":
             return
@@ -1246,28 +1265,184 @@ class BRDFForm(QWidget):
             return
         raise ValueError(f"Unsupported PSD function: {current}")
 
-    # ===== Run BRDFProg =====
-    def run_brdfprog(self):
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        data_dir = get_data_dir(create=True)
-        input_filename = str(data_dir / f"brdf_input_{timestamp}.txt")
-        output_filename = str(data_dir / f"brdf_output_{timestamp}.txt")
-        csv_filename = str(data_dir / f"brdf_output_{timestamp}.csv")
+    def _append_psd_input_lines(self, input_lines):
+        self._append_psd_named_input_lines(input_lines, self.psd_function.currentText())
 
-        # Gather inputs in the order expected by brdfprog
-        input_lines = [
-            self.incident_angle.text(), self.scatter_start.text(), self.scatter_end.text(),
-            self.scatter_step.text(), self.azimuth_start.text(), self.azimuth_end.text(),
-            self.azimuth_step.text(),
-        ]
+    def _append_one_d_grating_input_lines(self, input_lines, value: str = None, *, grating_tree=None):
+        tree = grating_tree if grating_tree is not None else self._current_rcw_grating_tree()
+        if value:
+            model_name, args, kwargs = self._parse_model_expression(value)
+            if args or kwargs:
+                self._raise_unsupported_parameterized_expression("Grating_Ptr", value)
+            if model_name:
+                tree = build_default_one_d_grating(model_name)
+        errors = validate_one_d_grating(tree)
+        if errors:
+            raise ValueError("1D grating validation failed:\n- " + "\n- ".join(errors))
+        input_lines.extend(serialize_one_d_grating(tree))
+        self._rcw_grating_state = tree
+
+    def _append_reflectance_input_lines(self, input_lines, value: str):
+        reflectance_model, args, kwargs = self._parse_model_expression(value)
+        if not reflectance_model:
+            reflectance_model = "Table_Reflectance"
+        input_lines.append(reflectance_model)
+
+        if reflectance_model != "Table_Reflectance":
+            raise ValueError(
+                "Only Table_Reflectance(value_or_filename) is supported in the public GUI."
+            )
+
+        reflectance_value = ""
+        if args:
+            reflectance_value = args[0]
+        else:
+            reflectance_value = kwargs.get("value") or kwargs.get("table") or "1"
+        reflectance_value = str(reflectance_value).strip()
+        if not reflectance_value:
+            raise ValueError("Table_Reflectance requires a numeric value or filename.")
+        input_lines.append(reflectance_value)
+
+    def _append_axisymmetric_shape_input_lines(self, input_lines, value: str):
+        shape_model, args, kwargs = self._parse_model_expression(value)
+        if not shape_model:
+            shape_model = "Ellipsoid_Axisymmetric_Shape"
+        if shape_model != "Ellipsoid_Axisymmetric_Shape":
+            raise ValueError(
+                "Only Ellipsoid_Axisymmetric_Shape(...) is supported in the public GUI."
+            )
+
+        defaults = {
+            "npoints": "100",
+            "vertical": "0.05",
+            "horizontal": "0.05",
+            "offset": "0",
+        }
+        positional_names = ["npoints", "vertical", "horizontal", "offset"]
+        for name, arg in zip(positional_names, args):
+            defaults[name] = arg
+        for key in positional_names:
+            if key in kwargs:
+                defaults[key] = kwargs[key]
+
+        horizontal = self._safe_float(defaults["horizontal"])
+        if horizontal is None or horizontal <= 0:
+            raise ValueError("Ellipsoid_Axisymmetric_Shape requires a positive horizontal radius.")
+
+        input_lines.append(shape_model)
+        input_lines.extend([
+            defaults["npoints"],
+            defaults["vertical"],
+            defaults["horizontal"],
+            defaults["offset"],
+        ])
+
+    def _append_brdf_model_input_lines(self, input_lines, value: str, *, depth: int = 0):
+        nested_model, _args, kwargs = self._parse_model_expression(value)
+        if not nested_model:
+            nested_model = "Microroughness_BRDF_Model"
+        if depth > 4:
+            raise ValueError(f"Nested BRDF model recursion is too deep near {nested_model}.")
+        if nested_model in {"Subsurface_Particle_BRDF_Model", "CrossRCW_BRDF_Model"}:
+            raise ValueError(f"{nested_model} is not supported in the public GUI.")
+        if nested_model not in self.MODEL_PARAM_SPECS:
+            raise ValueError(f"Unsupported nested BRDF model: {nested_model}")
+
+        specs = self.MODEL_PARAM_SPECS[nested_model]
+        defaults = {name.lower(): str(default) for name, _dtype, default in specs}
+        input_lines.append(nested_model)
+        input_lines.append(kwargs.get("lambda", self.wavelength.text().strip() or defaults.get("lambda", "0.532")))
+        input_lines.append(kwargs.get("substrate", self.substrate.text().strip() or defaults.get("substrate", "(4.05,0.05)")))
+        input_lines.append(kwargs.get("type", self.DIRECTION_CODES.get(self.direction.currentText(), defaults.get("type", "0"))))
+
+        for name, dtype, default in specs:
+            lowered = name.lower()
+            if lowered in {"lambda", "substrate", "type"}:
+                continue
+
+            if dtype == "PSD_Function_Ptr":
+                psd_value = kwargs.get(lowered, "Unit_PSD_Function")
+                psd_model, psd_args, psd_kwargs = self._parse_model_expression(psd_value)
+                if psd_args or psd_kwargs:
+                    self._raise_unsupported_parameterized_expression(dtype, psd_value)
+                self._append_psd_named_input_lines(input_lines, psd_model or "Unit_PSD_Function")
+                continue
+
+            raw_value = kwargs.get(lowered, str(default))
+            self._append_param_value_input_lines(
+                input_lines,
+                name=name,
+                dtype=dtype,
+                value=raw_value,
+                model_name=nested_model,
+                depth=depth + 1,
+            )
+
+    def _append_param_value_input_lines(
+        self,
+        input_lines,
+        *,
+        name: str,
+        dtype: str,
+        value: str,
+        model_name: str,
+        depth: int = 0,
+    ):
+        if dtype == "Free_Space_Scatterer_Ptr":
+            self._append_scatterer_input_lines(input_lines, value, model_name)
+            return
+        if dtype == "BRDF_Model_Ptr":
+            self._append_brdf_model_input_lines(input_lines, value, depth=depth)
+            return
+        if dtype == "Reflectance":
+            self._append_reflectance_input_lines(input_lines, value)
+            return
+        if dtype == "Axisymmetric_Shape":
+            self._append_axisymmetric_shape_input_lines(input_lines, value)
+            return
+        if dtype == "Grating_Ptr":
+            self._append_one_d_grating_input_lines(input_lines, value)
+            return
+
+        model_ptr_name, args, kwargs = self._parse_model_expression(value)
+        if (args or kwargs) and dtype.endswith("_Ptr"):
+            self._raise_unsupported_parameterized_expression(dtype, value)
+
+        if name == "coefficientfile":
+            coefficient_path = str(value).strip()
+            if not coefficient_path:
+                raise ValueError("coefficientfile is required for ZernikeExpansion_BRDF_Model.")
+            if not Path(coefficient_path).exists():
+                raise ValueError(f"coefficientfile does not exist: {coefficient_path}")
+
+        input_lines.append(str(value))
+
+    def _build_input_lines(self):
+        incident = self._safe_float(self.incident_angle.text())
+        scatter_step = self._safe_float(self.scatter_step.text())
+        azimuth_step = self._safe_float(self.azimuth_step.text())
+        if incident is None:
+            raise ValueError("Incident angle must be numeric.")
+        if scatter_step is None or scatter_step <= 0:
+            raise ValueError("Scattering step must be a positive number.")
+        if azimuth_step is None or azimuth_step <= 0:
+            raise ValueError("Azimuth step must be a positive number.")
 
         fam = self.family_selector.currentText()
         model = self._current_model_name()
-        specs = self._current_model_specs()
-        has_psd = any(name.lower() == "psd" or dtype == "PSD_Function_Ptr" for name, dtype, _ in specs)
+        if model in {"Subsurface_Particle_BRDF_Model", "CrossRCW_BRDF_Model"}:
+            raise ValueError(f"{model} is not supported in the public GUI.")
 
-        # Model selection menu sequence: first family, then subclass when applicable.
-        input_lines.append(fam)
+        input_lines = [
+            self.incident_angle.text(),
+            self.scatter_start.text(),
+            self.scatter_end.text(),
+            self.scatter_step.text(),
+            self.azimuth_start.text(),
+            self.azimuth_end.text(),
+            self.azimuth_step.text(),
+            fam,
+        ]
         if model and model != fam:
             input_lines.append(model)
 
@@ -1277,39 +1452,61 @@ class BRDFForm(QWidget):
             self.DIRECTION_CODES.get(self.direction.currentText(), "0"),
         ]
 
-        if has_psd:
-            self._append_psd_input_lines(input_lines)
+        specs = self._current_model_specs()
+        for name, dtype, default in specs:
+            lowered = name.lower()
+            if lowered in {"lambda", "substrate", "type"}:
+                continue
 
-        try:
-            if model == "CrossRCW_BRDF_Model":
+            if model == "RCW_BRDF_Model" and dtype == "Grating_Ptr" and name == "grating":
+                self._append_one_d_grating_input_lines(
+                    input_lines,
+                    grating_tree=self._current_rcw_grating_tree(),
+                )
+                continue
+            if model == "CrossRCW_BRDF_Model" and dtype == "CrossGrating_Ptr" and name == "grating":
                 self._append_cross_rcw_input_lines(
                     input_lines,
                     model_params=self._collect_model_params(),
                 )
-            else:
-                for name, dtype, default in specs:
-                    lowered = name.lower()
-                    if lowered in {"psd", "lambda", "substrate", "type"}:
-                        continue
-                    widget = self.param_widgets.get(name)
-                    value = widget.text().strip() if widget is not None else str(default)
+                return input_lines
+            if dtype == "PSD_Function_Ptr":
+                self._append_psd_input_lines(input_lines)
+                continue
 
-                    if dtype == "Free_Space_Scatterer_Ptr":
-                        self._append_scatterer_input_lines(input_lines, value, model)
-                    else:
-                        model_ptr_name, model_kwargs = self._parse_model_expression(value)
-                        if dtype.endswith("_Ptr") and model_ptr_name and model_kwargs:
-                            # For unknown nested model pointers, append the model choice only.
-                            input_lines.append(model_ptr_name)
-                        else:
-                            input_lines.append(value)
+            widget = self.param_widgets.get(name)
+            value = widget.text().strip() if widget is not None else str(default)
+            self._append_param_value_input_lines(
+                input_lines,
+                name=name,
+                dtype=dtype,
+                value=value,
+                model_name=model,
+            )
+        return input_lines
+
+    # ===== Run BRDFProg =====
+    def run_brdfprog(self):
+        self.last_stdout_path = None
+        self.last_input_path = None
+        self.last_csv_path = None
+        self.last_output_meta = None
+
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+        data_dir = get_data_dir(create=True)
+        input_filename = str(data_dir / f"brdf_input_{timestamp}.txt")
+        output_filename = str(data_dir / f"brdf_output_{timestamp}.txt")
+        csv_filename = str(data_dir / f"brdf_output_{timestamp}.csv")
+
+        try:
+            input_lines = self._build_input_lines()
         except ValueError as e:
             self.output_box.setText(f"[Error] {e}")
             return
 
         try:
             with open(input_filename, "w", encoding="utf-8") as f:
-                f.write("\n".join(input_lines))
+                f.write("\n".join(input_lines) + "\n")
 
             exe = find_solver_executable("brdfprog")
             if not exe:
@@ -1345,8 +1542,8 @@ class BRDFForm(QWidget):
             self.last_stdout_path = output_filename
             self.output_box.append("brdfprog completed. Parsing output table…")
 
-
             numeric_rows = []
+            finite_numeric_rows = []
             header_tokens = []
             last_text_tokens = []
             splitter = re.compile(r"[\s,]+")
@@ -1369,6 +1566,8 @@ class BRDFForm(QWidget):
                     row.append(value)
                 if numeric and row:
                     numeric_rows.append(row)
+                    if row and math.isfinite(row[-1]):
+                        finite_numeric_rows.append(row)
                     if not header_tokens and last_text_tokens:
                         header_tokens = list(last_text_tokens)
                 else:
@@ -1377,14 +1576,17 @@ class BRDFForm(QWidget):
             if not header_tokens and last_text_tokens:
                 header_tokens = list(last_text_tokens)
                 
-            if numeric_rows:
+            if finite_numeric_rows:
                 with open(csv_filename, "w", newline="", encoding="utf-8") as csvfile:
                     writer = csv.writer(csvfile)
-                    for row in numeric_rows:
+                    for row in finite_numeric_rows:
                         writer.writerow(row)
                 self.output_box.append(f"Saved CSV: {csv_filename}")
                 self.last_csv_path = csv_filename
-                column_count = max(len(r) for r in numeric_rows)
+                dropped_rows = len(numeric_rows) - len(finite_numeric_rows)
+                if dropped_rows:
+                    self.output_box.append(f"Dropped {dropped_rows} non-finite rows from solver output.")
+                column_count = max(len(r) for r in finite_numeric_rows)
                 meta = self._build_output_meta(
                     csv_filename=csv_filename,
                     stdout_path=output_filename,
@@ -1408,7 +1610,7 @@ class BRDFForm(QWidget):
                     self.output_box.append("No textual header detected; using numeric inference.")
                 self.render_with_external(csv_filename)
             else:
-                self.output_box.append("No numeric data detected in BRDFProg output; graph not updated.")
+                self.output_box.append("No finite numeric data detected in BRDFProg output; graph not updated.")
         except Exception as e:  
             self.output_box.setText(f"[Exception] {e}")
 
@@ -1508,6 +1710,8 @@ class BRDFForm(QWidget):
             "psd_all": {},
         }
         data["model_params"] = self._collect_model_params()
+        if data["model"] == "RCW_BRDF_Model":
+            data["grating_tree"] = self._current_rcw_grating_tree()
         if data["model"] == "CrossRCW_BRDF_Model":
             data["grating_tree"] = self._current_cross_grating_tree()
 
@@ -1679,6 +1883,8 @@ class BRDFForm(QWidget):
                     lowered = name.lower()
                     if lowered in {"psd", "lambda", "substrate", "type"}:
                         continue
+                    if current_model == "RCW_BRDF_Model" and dtype == "Grating_Ptr" and name == "grating":
+                        continue
                     if current_model == "CrossRCW_BRDF_Model" and dtype == "CrossGrating_Ptr" and name == "grating":
                         continue
                     if name not in model_params:
@@ -1686,6 +1892,11 @@ class BRDFForm(QWidget):
                     widget = self.param_widgets.get(name)
                     if widget is not None:
                         widget.setText(str(model_params[name]))
+                if current_model == "RCW_BRDF_Model":
+                    tree = p.get("grating_tree")
+                    if tree is not None and self.rcw_grating_editor is not None:
+                        self.rcw_grating_editor.from_node(tree)
+                        self._rcw_grating_state = self.rcw_grating_editor.to_node()
                 if current_model == "CrossRCW_BRDF_Model":
                     tree = p.get("grating_tree")
                     if tree is not None and self.cross_grating_editor is not None:

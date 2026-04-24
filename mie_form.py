@@ -3,22 +3,23 @@ import re
 import csv
 import datetime
 import subprocess
-import importlib
-from pathlib import Path
 from scatmech_paths import (
     configure_scatmech_path,
     find_solver_executable,
     format_missing_solver_message,
     get_data_dir,
 )
+from mieplot import (
+    plot_csv as plot_mie_csv,
+    set_color_scale as set_mie_color_scale,
+    set_metric as set_mie_metric,
+)
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QLineEdit,
     QVBoxLayout, QHBoxLayout,
     QPushButton, QTextEdit, QGroupBox,
-    QFormLayout, QFileDialog,
-    QDialog, QTableWidget, QTableWidgetItem, QSizePolicy, QMenu
+    QFormLayout, QDialog, QTableWidget, QTableWidgetItem, QSizePolicy, QComboBox
 )
-from PyQt5.QtCore import pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -27,9 +28,6 @@ configure_scatmech_path()
 
 
 class MieForm(QWidget):
-    
-    requestClearPlot = pyqtSignal() 
-    
     def __init__(self):
         super().__init__()
 
@@ -57,13 +55,13 @@ class MieForm(QWidget):
         self.main_layout.setStretch(1, 1)
 
         # Input 
-        grp = QGroupBox("Parameters")
+        grp = QGroupBox("Simulation Parameters")
         form = QFormLayout()
 
         self.step_angle_deg = QLineEdit("1")
         form.addRow("Step Angle (theta, deg):", self.step_angle_deg)
 
-        self.step_phi_deg = QLineEdit("1")
+        self.step_phi_deg = QLineEdit("10")
         form.addRow("Step Azimuth (phi, deg):", self.step_phi_deg)
 
         self.wavelength_um = QLineEdit("0.532")
@@ -78,24 +76,16 @@ class MieForm(QWidget):
         self.sphere_optics = QLineEdit("(1.59,0)")
         form.addRow("Optical Properties of the Sphere (n,k):", self.sphere_optics)
 
+        self.metric_combo = QComboBox()
+        self.metric_combo.addItems(["S11", "Pol", "S33", "S34"])
+        form.addRow("Metric:", self.metric_combo)
+
         grp.setLayout(form)
         self.form_layout.addWidget(grp)
 
         # Controls 
         ctrl = QHBoxLayout()
         self.run_btn = QPushButton("Run MieProg")
-        self.metric_menu = QMenu(self.run_btn)
-        for _name in ["S11", "Pol", "S33", "S34"]:
-            act = self.metric_menu.addAction(_name)
-            act.triggered.connect(lambda checked, n=_name: self.run_with_metric(n))
-            
-        self.run_btn.setMenu(self.metric_menu)
-        
-        self.run_btn.setStyleSheet(
-    "QPushButton { text-align: center; } "
-    "QPushButton::menu-indicator { subcontrol-position: right center; }"
-)
-        
         self.clear_btn = QPushButton("Clear Plot")
         self.log_color_btn = QPushButton("Log Color: Off")
         self.log_color_btn.setCheckable(True)
@@ -127,38 +117,23 @@ class MieForm(QWidget):
         # Signals
         self.run_btn.clicked.connect(self.run_mieprog)
         self.clear_btn.clicked.connect(self.clear_plot)
+        self.metric_combo.currentTextChanged.connect(self._on_metric_changed)
         self.log_color_btn.toggled.connect(self.toggle_log_color_scale)
         self.open_output_btn.clicked.connect(self.open_last_output)
         self.open_input_btn.clicked.connect(self.open_last_input)
 
-        # Optional external clear callback
-        self._plot_clear_callback = None
-
         # Default intensity function
-        self.metric_name = "S11"
+        self.metric_name = self.metric_combo.currentText()
         self.color_scale = "linear"
 
         # State
         self.last_stdout_path = None
         self.last_input_path = None
         self.last_csv_path = None
+        self.last_rendered_csv_path = None
 
-    def connect_plot_clear(self, slot):
-        self._plot_clear_callback = slot
-
-        # Core actions 
+    # Core actions 
     def clear_plot(self):
-        sig = getattr(self, "requestClearPlot", None)
-        if sig is not None:
-            try:
-                sig.emit()
-            except Exception as e:
-                self.log.append(f"Clear-plot signal error: {e}")
-        if callable(getattr(self, "_plot_clear_callback", None)):
-            try:
-                self._plot_clear_callback()
-            except Exception as e:
-                self.log.append(f"Clear-plot callback error: {e}")
         if hasattr(self, 'figure'):
             self.figure.clear()
         if hasattr(self, 'canvas'):
@@ -281,111 +256,73 @@ class MieForm(QWidget):
 
         # External plot module connection
     def render_with_external(self, csv_path: str):
-       
-        import sys, os, importlib, importlib.util
+        if csv_path:
+            self.last_rendered_csv_path = csv_path
+            self.last_csv_path = csv_path
 
-        # Prepare axes
-        self.figure.clear()
-        ax = self.figure.gca()
-
-        here = os.path.dirname(os.path.abspath(__file__))
-        cwd  = os.getcwd()
-        csv_dir = os.path.dirname(os.path.abspath(csv_path)) if csv_path else None
-
-        tried = []
-
-        def _try_normal(name):
-            try:
-                mod = importlib.import_module(name)
-                return mod, f"import {name}"
-            except Exception as e:
-                tried.append(f"import {name}: {e}")
-                return None, None
-
-        def _try_file(path):
-            try:
-                if path and os.path.exists(path):
-                    spec = importlib.util.spec_from_file_location("mieplot", path)
-                    if spec and spec.loader:
-                        mod = importlib.util.module_from_spec(spec)
-                        sys.modules["mieplot"] = mod
-                        spec.loader.exec_module(mod)
-                        return mod, f"load {path}"
-            except Exception as e:
-                tried.append(f"load {path}: {e}")
-            return None, None
-
-        # check 
-        if here not in sys.path:
-            sys.path.insert(0, here)
-
-        # check
-        mod, how = _try_normal("mieplot")
-
-        if mod is None:
-            mod, how = _try_file(os.path.join(here, "mieplot.py"))
-        if mod is None:
-            mod, how = _try_file(os.path.join(cwd, "mieplot.py"))
-        if mod is None and csv_dir:
-            mod, how = _try_file(os.path.join(csv_dir, "mieplot.py"))
-
-        if mod is None:
-            self.log.append("Could not import mieplot.py: " + " | ".join(tried))
-            self.canvas.draw()
-            return
-        else:
-            self.log.append(f"mieplot resolved via: {how}")
-
-        setm = getattr(mod, "set_metric", None)
-        if callable(setm):
-            try:
-                setm(getattr(self, "metric_name", "S11"))
-            except Exception as e:
-                self.log.append(f"Warning: could not set metric on mieplot: {e}")
-
-        scale = getattr(self, "color_scale", "linear")
-        sets = getattr(mod, "set_color_scale", None)
-        if callable(sets):
-            try:
-                sets(scale)
-            except Exception as e:
-                self.log.append(f"Warning: could not set color scale on mieplot: {e}")
-        elif scale == "log":
-            self.log.append("Warning: loaded mieplot.py does not support log color scale.")
-
-        fn = getattr(mod, "plot_csv", None)
-        if not callable(fn):
-            self.log.append("mieplot.py found, but it must define plot_csv(ax, csv_path).")
-            self.canvas.draw()
-            return
+        def _render(scale: str):
+            self.figure.clear()
+            ax = self.figure.add_subplot(111, projection="3d")
+            set_mie_metric(getattr(self, "metric_name", "S11"))
+            set_mie_color_scale(scale)
+            plot_mie_csv(ax, csv_path)
 
         try:
-            fn(ax, csv_path)
+            _render(getattr(self, "color_scale", "linear"))
             self.canvas.draw()
-            self.log.append("Plot updated via mieplot.plot_csv")
+            self.log.append("Plot updated.")
         except Exception as e:
+            if self.color_scale == "log":
+                previous = self.log_color_btn.blockSignals(True)
+                self.log_color_btn.setChecked(False)
+                self.log_color_btn.blockSignals(previous)
+                self.color_scale = "linear"
+                self.log_color_btn.setText("Log Color: Off")
+                try:
+                    _render("linear")
+                    self.canvas.draw()
+                    self.log.append(f"mieplot render error: {e}")
+                    self.log.append("Log color scale is unavailable for the current metric. Reverted to linear scale.")
+                    self.log.append("Plot updated.")
+                    return
+                except Exception as fallback_exc:
+                    self.log.append(f"mieplot render error: {fallback_exc}")
+                    self.canvas.draw()
+                    return
             self.log.append(f"mieplot render error: {e}")
             self.canvas.draw()
 
     def toggle_log_color_scale(self, checked: bool):
         self.color_scale = "log" if checked else "linear"
         self.log_color_btn.setText("Log Color: On" if checked else "Log Color: Off")
-        csv_path = getattr(self, "last_csv_path", None)
-        if not csv_path or not os.path.exists(csv_path):
+        if not self._rerender_last_plot():
             view_name = "log" if checked else "normal"
             self.log.append(f"Color scale selected: {view_name}. It will apply after the next MieProg run.")
             return
-
+        if checked and self.color_scale != "log":
+            self.log.append("Log color scale is unavailable for the current metric; linear scale remains active.")
+            return
         view_name = "log" if checked else "normal"
-        self.log.append(f"Color scale selected: {view_name}. Re-rendering last Mie plot...")
-        self.render_with_external(csv_path)
+        self.log.append(f"Color scale selected: {view_name}. Re-rendered current Mie plot.")
 
-    def run_with_metric(self, name: str):
+    def _on_metric_changed(self, name: str):
         if not name:
             return
         self.metric_name = name
-        self.log.append(f"Metric selected: {name}. Running mieprog...")
-        self.run_mieprog()
+        if self._rerender_last_plot():
+            self.log.append(f"Metric selected: {name}. Re-rendered current Mie plot.")
+        else:
+            self.log.append(f"Metric selected: {name}. It will apply after the next Mie plot is available.")
+
+    def _rerender_last_plot(self) -> bool:
+        csv_path = (
+            getattr(self, "last_rendered_csv_path", None)
+            or getattr(self, "last_csv_path", None)
+        )
+        if not csv_path or not os.path.exists(csv_path):
+            return False
+        self.render_with_external(csv_path)
+        return True
 
 
     # Parameter 
@@ -397,6 +334,8 @@ class MieForm(QWidget):
             "medium_optics": self._get_text("medium_optics", "(1,0)"),
             "radius_um": self._get_text("radius_um", "0.05"),
             "sphere_optics": self._get_text("sphere_optics", "(1.59,0)"),
+            "metric": self.metric_combo.currentText(),
+            "color_scale": self.color_scale,
         }
 
     def from_params(self, p: dict):
@@ -406,6 +345,20 @@ class MieForm(QWidget):
         self._set_text("medium_optics", p.get("medium_optics"))
         self._set_text("radius_um", p.get("radius_um"))
         self._set_text("sphere_optics", p.get("sphere_optics"))
+        metric = p.get("metric")
+        if metric:
+            idx = self.metric_combo.findText(str(metric))
+            if idx >= 0:
+                previous = self.metric_combo.blockSignals(True)
+                self.metric_combo.setCurrentIndex(idx)
+                self.metric_combo.blockSignals(previous)
+                self.metric_name = self.metric_combo.currentText()
+        scale = str(p.get("color_scale", "linear") or "linear").lower()
+        previous = self.log_color_btn.blockSignals(True)
+        self.log_color_btn.setChecked(scale == "log")
+        self.log_color_btn.blockSignals(previous)
+        self.color_scale = "log" if scale == "log" else "linear"
+        self.log_color_btn.setText("Log Color: On" if self.color_scale == "log" else "Log Color: Off")
 
     # Viewers 
     def _find_latest(self, prefix: str, folder: str):
